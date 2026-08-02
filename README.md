@@ -119,6 +119,10 @@ Your terminal emulator must also honour OSC 52. Most do; a few require it to be
 enabled. If the status line says `copied` but pasting gives you the old
 clipboard, that is where to look.
 
+For the measured details — transcript format, why tty keying fails, the
+Stop-hook race, and the two dead ends before the current design — see
+[docs/DESIGN.md](docs/DESIGN.md).
+
 ## Notes and limits
 
 - **tmux is required for the keybinding.** It is the only layer that can catch a
