@@ -1,0 +1,110 @@
+#!/bin/sh
+# cc-yank — put Claude Code's last answer on your clipboard.
+#
+# The Stop hook has already extracted the answer to a state file, so this
+# only has to deliver it. Usage:
+#
+#   cc-yank [pane-id]     deliver to clipboard   (pane-id like %9, from tmux)
+#   cc-yank --print       write the answer to stdout instead
+#
+# Over SSH there is usually no local clipboard to write to. OSC 52 solves
+# that: it is an escape sequence asking the *terminal emulator* — the one in
+# front of you — to set its own clipboard. tmux emits it for us with
+# `load-buffer -w`, provided `set-clipboard on`.
+
+set -eu
+
+MAX_BYTES=65536   # OSC 52 payloads are capped by the emulator (xterm ~74 KB)
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-yank"
+
+pane=""
+print_only=0
+for arg in "$@"; do
+    case "$arg" in
+        --print) print_only=1 ;;
+        -*)      ;;
+        *)       pane="$arg" ;;
+    esac
+done
+[ -n "$pane" ] || pane="${TMUX_PANE:-}"
+
+# Same key the hook writes under: %9 -> pane-9.md
+shared="$STATE_DIR/default.md"
+if [ -n "$pane" ]; then
+    src="$STATE_DIR/pane-$(printf '%s' "$pane" | sed 's/^%//').md"
+else
+    src="$shared"
+fi
+
+# Never fall back to default.md when the pane is known. It is one shared file
+# that every session unable to resolve its pane writes to, so with more than
+# one Claude Code running it hands over another session's answer — worse than
+# handing over nothing.
+
+# Report back through tmux when we have a pane to talk to, otherwise stderr.
+# A clipboard tool that says nothing cannot be trusted.
+notify() {
+    if [ -n "$pane" ] && [ -n "${TMUX:-}" ]; then
+        tmux display-message -t "$pane" "cc-yank: $1" 2>/dev/null || echo "cc-yank: $1" >&2
+    else
+        echo "cc-yank: $1" >&2
+    fi
+}
+
+if [ ! -s "$src" ]; then
+    notify "nothing to copy yet"
+    exit 0
+fi
+
+size=$(wc -c < "$src" | tr -d ' ')
+
+payload=$(mktemp "${TMPDIR:-/tmp}/cc-yank.XXXXXX")
+trap 'rm -f "$payload"' EXIT INT TERM
+
+if [ "$size" -gt "$MAX_BYTES" ]; then
+    # Cut on a line boundary — a raw byte cut would split a UTF-8 character
+    # and hand the terminal an invalid payload. Leave room for the notice
+    # below so the total still fits under MAX_BYTES.
+    head -c "$((MAX_BYTES - 256))" "$src" | sed '$d' > "$payload"
+    printf '\n\n[cc-yank: truncated, %s bytes total — full text at %s]\n' "$size" "$src" >> "$payload"
+    note=" (truncated from $size B)"
+else
+    cp "$src" "$payload"
+    note=""
+fi
+
+if [ "$print_only" -eq 1 ]; then
+    cat "$payload"
+    exit 0
+fi
+
+human_size=$(awk -v b="$size" 'BEGIN{ if (b<1024) printf "%d B", b; else printf "%.1f KB", b/1024 }')
+
+# First backend that fits wins. tmux comes first: inside tmux it is correct
+# both locally and over SSH, and it handles the OSC 52 encoding itself.
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer -w - < "$payload"
+    backend="tmux/osc52"
+elif [ "$(uname -s)" = "Darwin" ] && command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$payload"
+    backend="pbcopy"
+elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+    wl-copy < "$payload"
+    backend="wl-copy"
+elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard < "$payload"
+    backend="xclip"
+elif [ -n "${DISPLAY:-}" ] && command -v xsel >/dev/null 2>&1; then
+    xsel --input --clipboard < "$payload"
+    backend="xsel"
+elif [ -w /dev/tty ]; then
+    # No clipboard program and no tmux: speak OSC 52 directly to the terminal.
+    b64=$(base64 < "$payload" | tr -d '\n')
+    printf '\033]52;c;%s\a' "$b64" > /dev/tty
+    backend="osc52"
+else
+    notify "no clipboard backend — answer is at $src"
+    exit 0
+fi
+
+notify "copied $human_size$note [$backend]"
