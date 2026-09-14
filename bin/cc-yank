@@ -2,10 +2,7 @@
 # cc-yank — put Claude Code's last answer on your clipboard.
 #
 # The Stop hook has already extracted the answer to a state file, so this
-# only has to deliver it. Usage:
-#
-#   cc-yank [pane-id]     deliver to clipboard   (pane-id like %9, from tmux)
-#   cc-yank --print       write the answer to stdout instead
+# only has to deliver it. Run `cc-yank --help` for the option list.
 #
 # Over SSH there is usually no local clipboard to write to. OSC 52 solves
 # that: it is an escape sequence asking the *terminal emulator* — the one in
@@ -14,17 +11,51 @@
 
 set -eu
 
+VERSION=0.2.0
 MAX_BYTES=65536   # OSC 52 payloads are capped by the emulator (xterm ~74 KB)
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cc-yank"
 
+usage() {
+    cat <<'EOF'
+cc-yank — put Claude Code's last answer on your clipboard.
+
+Usage:
+  cc-yank [PANE]     copy that pane's answer  (PANE like %3, default $TMUX_PANE)
+  cc-yank --print    write it to stdout instead of the clipboard
+  cc-yank --path     print the state file path and exit
+  cc-yank --list     list stored answers, newest first
+  cc-yank --clean    delete all stored answers
+  cc-yank --version  print the version
+  cc-yank --help     show this
+
+Answers are written by the Stop hook when Claude finishes a turn, one file per
+tmux pane, under ${XDG_STATE_HOME:-~/.local/state}/cc-yank.
+EOF
+}
+
+# stat and date differ between GNU and BSD; try both spellings.
+mtime_epoch() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+# Date included on purpose: stored answers routinely span days, and a bare
+# clock makes an old file look current.
+fmt_clock() { date -d "@$1" '+%m-%d %H:%M' 2>/dev/null || date -r "$1" '+%m-%d %H:%M'; }
+
 pane=""
-print_only=0
-for arg in "$@"; do
-    case "$arg" in
-        --print) print_only=1 ;;
-        -*)      ;;
-        *)       pane="$arg" ;;
+mode=copy
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --print)   mode=print ;;
+        --path)    mode=path ;;
+        --list)    mode=list ;;
+        --clean)   mode=clean ;;
+        --version) echo "cc-yank $VERSION"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        --)        shift; if [ $# -gt 0 ]; then pane="$1"; fi; break ;;
+        -*)        printf 'cc-yank: unknown option: %s\n\n' "$1" >&2
+                   usage >&2
+                   exit 2 ;;
+        *)         pane="$1" ;;
     esac
+    shift
 done
 [ -n "$pane" ] || pane="${TMUX_PANE:-}"
 
@@ -40,6 +71,40 @@ fi
 # that every session unable to resolve its pane writes to, so with more than
 # one Claude Code running it hands over another session's answer — worse than
 # handing over nothing.
+
+# Inspection modes run before the "is there an answer" guard: they are what you
+# reach for precisely when there is no answer and you want to know why.
+if [ "$mode" = path ]; then
+    printf '%s\n' "$src"
+    exit 0
+fi
+
+if [ "$mode" = list ]; then
+    set -- "$STATE_DIR"/*.md          # args are parsed; reusing $@ is safe here
+    if [ ! -e "$1" ]; then            # unmatched glob stays literal
+        echo "no answers stored yet"
+        exit 0
+    fi
+    for f in "$@"; do
+        epoch=$(mtime_epoch "$f")
+        printf '%s\t%-12s %8s B  %s\n' \
+            "$epoch" \
+            "$(basename "$f" .md)" \
+            "$(wc -c < "$f" | tr -d ' ')" \
+            "$(fmt_clock "$epoch")"
+    done | sort -rn | cut -f2-
+    exit 0
+fi
+
+if [ "$mode" = clean ]; then
+    n=0
+    for f in "$STATE_DIR"/*.md; do
+        [ -e "$f" ] || break             # unmatched glob stays literal
+        rm -f "$f"; n=$((n + 1))
+    done
+    echo "removed $n stored answer(s)"
+    exit 0
+fi
 
 # Report back through tmux when we have a pane to talk to, otherwise stderr.
 # A clipboard tool that says nothing cannot be trusted.
@@ -73,7 +138,7 @@ else
     note=""
 fi
 
-if [ "$print_only" -eq 1 ]; then
+if [ "$mode" = print ]; then
     cat "$payload"
     exit 0
 fi

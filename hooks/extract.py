@@ -5,8 +5,8 @@ Runs as a Stop hook. Reads the hook payload on stdin, tails the session
 transcript backwards, and writes the answer's markdown source to the state
 directory so a keypress can deliver it instantly.
 
-Never writes to stdout and always exits 0 — a crashing hook must not disturb
-the session.
+Never writes to stdout (unless asked with --stdout) and always exits 0 — a
+crashing hook must not disturb the session.
 """
 
 import json
@@ -14,11 +14,18 @@ import os
 import sys
 import time
 
+VERSION = "0.2.0"
 CHUNK = 256 * 1024
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
     "cc-yank",
 )
+# The transcript is written asynchronously and lags the hook. How long we are
+# willing to wait for it, and how often we look. Overridable for tests.
+SETTLE_MAX = float(os.environ.get("CC_YANK_SETTLE_MAX", "3"))
+POLL = 0.1
+QUIET_POLLS = 6          # legacy settle: this many unchanged polls in a row
+KEEP_DAYS = 30           # stored answers older than this are pruned
 
 
 def iter_lines_reverse(path, chunk_size=CHUNK):
@@ -104,9 +111,10 @@ def extract_answer(lines):
 def tmux_pane():
     """Find the tmux pane this session lives in.
 
-    Claude Code spawns hooks with a sanitised environment, so TMUX_PANE is
-    normally absent here even when the session is inside tmux. Recover it from
-    an ancestor process. Linux-only; elsewhere we fall back to a shared file.
+    Claude Code passes TMUX_PANE through to hooks (measured on 2.1.270), so
+    the environment is normally enough. Older versions scrubbed it; for them,
+    recover it from an ancestor process. Linux-only; elsewhere we fall back
+    to a shared file.
     """
     pane = os.environ.get("TMUX_PANE")
     if pane:
@@ -129,23 +137,69 @@ def tmux_pane():
     return ""
 
 
-def stable_extract(path, settle=0.6, step=0.2, tries=8):
-    """Read the answer once the transcript has stopped growing.
+def squash(text):
+    return " ".join(text.split())
 
-    Stop fires before Claude Code has flushed the turn's final text block, so
-    reading immediately loses the last paragraph. Wait, then re-read until two
-    consecutive passes agree. The hook runs in the background long before the
-    key is pressed, so a second or two costs nothing.
+
+def caught_up(answer, last_message):
+    """True once the transcript holds the turn's final text block.
+
+    The hook payload carries that block as `last_assistant_message`; when the
+    extracted answer ends with it, nothing more is coming.
     """
-    time.sleep(settle)
-    previous = extract_answer(iter_lines_reverse(path))
-    for _ in range(tries):
-        time.sleep(step)
-        current = extract_answer(iter_lines_reverse(path))
-        if current == previous:
-            return current
-        previous = current
-    return previous
+    if not last_message:
+        return False
+    return squash(answer).endswith(squash(last_message))
+
+
+def settle(path, last_message, max_wait=None):
+    """Read the answer once the transcript has caught up with the turn.
+
+    Stop fires before Claude Code has flushed the turn's text to the
+    transcript — at fire time the file can hold no assistant line at all.
+    Poll it, re-extracting only when its size changes, until either the final
+    text block (`last_message`) appears or `max_wait` runs out.
+
+    Without `last_message` (older Claude Code) the only signal is quiet: the
+    file unchanged for QUIET_POLLS consecutive polls.
+    """
+    if max_wait is None:
+        max_wait = SETTLE_MAX
+    deadline = time.monotonic() + max_wait
+    answer = ""
+    size = None
+    quiet = 0
+    while True:
+        try:
+            current = os.stat(path).st_size
+        except OSError:
+            current = -1
+        if current != size:
+            size = current
+            quiet = 0
+            answer = extract_answer(iter_lines_reverse(path))
+            if caught_up(answer, last_message):
+                return answer
+        else:
+            quiet += 1
+            if not last_message and answer and quiet >= QUIET_POLLS:
+                return answer
+        if time.monotonic() >= deadline:
+            return answer
+        time.sleep(POLL)
+
+
+def complete(answer, last_message):
+    """Never lose the last paragraph.
+
+    If the transcript was still behind at the deadline, the hook payload is
+    the only copy of the final block. Append it rather than deliver an
+    answer with its ending missing.
+    """
+    last_message = (last_message or "").strip()
+    if not last_message or caught_up(answer, last_message):
+        return answer
+    return answer + "\n\n" + last_message if answer else last_message
 
 
 def state_path():
@@ -173,24 +227,69 @@ def write_answer(text, dest):
     os.replace(tmp, dest)
 
 
+def prune(keep_days=KEEP_DAYS, now=None):
+    """Drop stored answers nobody will ask for again.
+
+    Pane ids are reused across tmux restarts, so the directory would otherwise
+    grow one file per pane id ever seen, forever.
+    """
+    cutoff = (now if now is not None else time.time()) - keep_days * 86400
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".md"):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def parse_args(argv):
+    """Hook mode reads the payload from stdin; --transcript is for tests."""
+    opts = {"transcript": None, "last_message": None, "stdout": False}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--transcript", "--last-message"):
+            i += 1
+            if i >= len(argv):
+                sys.exit("extract.py: %s needs a value" % arg)
+            opts[arg.lstrip("-").replace("-", "_")] = argv[i]
+        elif arg == "--stdout":
+            opts["stdout"] = True
+        elif arg == "--version":
+            print("cc-yank extract %s" % VERSION)
+            sys.exit(0)
+        i += 1
+    return opts
+
+
 def main():
-    argv = sys.argv[1:]
-    if "--transcript" in argv:
-        transcript = argv[argv.index("--transcript") + 1]
+    opts = parse_args(sys.argv[1:])
+    if opts["transcript"]:
+        transcript, last_message = opts["transcript"], opts["last_message"]
     else:
         payload = json.loads(sys.stdin.read() or "{}")
         transcript = payload.get("transcript_path")
+        last_message = payload.get("last_assistant_message")
 
     if not transcript or not os.path.exists(transcript):
-        return
-
-    answer = stable_extract(transcript)
+        # The payload still carries the final block; better than nothing.
+        answer = complete("", last_message)
+    else:
+        answer = complete(settle(transcript, last_message), last_message)
     if not answer:
         return
 
     write_answer(answer, state_path())
+    prune()
 
-    if "--stdout" in argv:
+    if opts["stdout"]:
         sys.stdout.write(answer)
 
 

@@ -92,9 +92,28 @@ involves the model, costs no tokens, and adds no latency to your session.
 entries, so they are explicitly *not* treated as a turn boundary — an answer
 split around three tool calls still comes out as one clean document.
 
+**The transcript lags the hook.** Claude Code writes it asynchronously; when
+`Stop` fires the final paragraph is usually not on disk yet. The hook payload
+carries that paragraph as `last_assistant_message`, so the hook polls the
+file until it ends with it (typically < 50 ms, at most 3 s) and, if the
+transcript never catches up, appends it rather than lose the ending.
+
 **Transcripts get large** (100 MB+ on long sessions), so the file is read
 backwards in chunks from EOF and stops at the last human message. Cost does not
 grow with session length.
+
+### The command line
+
+```
+cc-yank [PANE]     copy that pane's answer  (PANE like %3, default $TMUX_PANE)
+cc-yank --print    write it to stdout instead of the clipboard
+cc-yank --path     print the state file path
+cc-yank --list     list stored answers, newest first
+cc-yank --clean    delete all stored answers
+```
+
+`--print` and `--path` are what to reach for when the keypress says "nothing
+to copy yet". Stored answers older than 30 days are pruned by the hook.
 
 ### OSC 52, or: why this works over SSH
 
@@ -138,6 +157,18 @@ Stop-hook race, and the two dead ends before the current design — see
   52 has an emulator-dependent size cap.
 - **Nothing leaves your machine.** No network, no telemetry. The answer was
   already on your screen; cc-yank writes it to one local file.
+
+## Development
+
+```sh
+make test     # python3 unittest + POSIX sh CLI tests, no dependencies
+make lint     # shellcheck, when installed
+```
+
+The tests build synthetic transcripts and drive the hook the way Claude Code
+does (payload on stdin, `TMUX_PANE` in the environment), including the case
+where the transcript is still behind when the hook fires. CI runs them on
+Linux and macOS. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

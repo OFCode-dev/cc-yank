@@ -107,9 +107,13 @@ rather than silently delivering a broken paste.
 
 This took three wrong answers.
 
-**`TMUX_PANE` from the hook's own environment.** Claude Code spawns hooks with
-a sanitised environment, so `TMUX_PANE` is absent even when the session is
-inside tmux. The hook silently wrote a shared file.
+**`TMUX_PANE` from the hook's own environment.** When this was first built,
+Claude Code spawned hooks with a sanitised environment and `TMUX_PANE` was
+absent even inside tmux, so the hook silently wrote a shared file. Re-measured
+on 2.1.270 (September 2026): the variable *is* passed through now, and the
+docs say hooks inherit the parent environment apart from `OTEL_*`. The
+environment is therefore the first thing checked again; the process walk
+below stays as the fallback for older versions.
 
 **The controlling tty.** Attractive, because both sides can compute it: tmux
 exposes `#{pane_tty}`, and a process can read its own from `/proc/self/stat`.
@@ -127,13 +131,35 @@ and the keybinding reports "nothing to copy yet" rather than guessing.
 
 ## The Stop-hook race
 
-`Stop` fires before Claude Code has flushed the turn's final text block to the
-transcript. Reading immediately loses the last paragraph — reliably, not
-intermittently.
+`Stop` fires before Claude Code has flushed the turn's text to the transcript.
+Reading immediately loses the last paragraph — reliably, not intermittently.
+Measured on 2.1.270 with a hook that copies the transcript at fire time: the
+copy held **no assistant line at all** (101 KB; the file grew to 210 KB
+afterwards). The docs confirm it: "the transcript file is written
+asynchronously and may lag the in-memory conversation".
 
-The hook therefore settles first: sleep, then re-read until two consecutive
-extractions agree (~0.8 s typical, 2.2 s worst case). It runs in the background
-long before the key is pressed, so the delay is invisible.
+The first design settled blind: sleep 0.6 s, then re-read every 0.2 s until
+two consecutive extractions agreed (~0.8 s typical, 2.2 s worst case, and
+the whole transcript tail re-parsed on every pass).
+
+The hook payload now carries **`last_assistant_message`** — the text blocks of
+the *final* assistant message of the turn, concatenated. It is not the whole
+answer (a turn split around tool calls has several assistant messages), but it
+is the exact thing the transcript is late with, which makes it a completion
+signal rather than a source:
+
+1. Poll the transcript every 0.1 s, re-extracting only when its size changed.
+2. Stop as soon as the extracted answer ends with `last_assistant_message`
+   (whitespace-insensitive). Typically the first read already matches: < 50 ms.
+3. Give up after 3 s. If the transcript is still behind, append
+   `last_assistant_message` to whatever was extracted — a document missing a
+   middle paragraph is rare; one missing its ending was the common case.
+
+Without the field (older Claude Code) the only signal is quiet: the file
+unchanged for six consecutive polls. That path is kept and tested.
+
+Stop hooks run asynchronously and do not delay the prompt, so none of this is
+felt in the session either way.
 
 ## Deliberate non-goals
 

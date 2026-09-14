@@ -107,7 +107,7 @@ else
 $MARK_BEGIN
 # prefix + y copies Claude Code's last answer. Prefix-based on purpose: a raw
 # binding would swallow the key before Claude Code's TUI ever sees it.
-bind-key y run-shell -b '$REPO/bin/cc-yank #{pane_id}'
+bind-key y run-shell -b '"$REPO/bin/cc-yank" #{pane_id}'
 $MARK_END
 EOF
     say "added prefix + y binding to $TMUX_CONF"
