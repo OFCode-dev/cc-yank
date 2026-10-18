@@ -12,6 +12,7 @@ crashing hook must not disturb the session.
 import json
 import os
 import sys
+import tempfile
 import time
 
 VERSION = "0.2.0"
@@ -55,7 +56,8 @@ def iter_lines_reverse(path, chunk_size=CHUNK):
 
 
 def blocks_of(entry):
-    content = (entry.get("message") or {}).get("content")
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, list):
         return [b for b in content if isinstance(b, dict)]
     if isinstance(content, str):
@@ -92,12 +94,17 @@ def extract_answer(lines):
 
         kind = entry.get("type")
         if kind == "assistant":
+            message_parts = []
             for block in blocks_of(entry):
                 # thinking and tool_use are not the answer.
-                if block.get("type") == "text":
-                    text = (block.get("text") or "").strip()
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    text = block["text"].strip()
                     if text:
-                        parts.append(text)
+                        message_parts.append(text)
+            # Only entries run backwards; blocks within an entry are already
+            # chronological and must stay together when parts is reversed.
+            if message_parts:
+                parts.append("\n\n".join(message_parts))
         elif kind == "user":
             if is_human_turn(entry):
                 break
@@ -147,9 +154,8 @@ def caught_up(answer, last_message):
     The hook payload carries that block as `last_assistant_message`; when the
     extracted answer ends with it, nothing more is coming.
     """
-    if not last_message:
-        return False
-    return squash(answer).endswith(squash(last_message))
+    final_text = squash(last_message or "")
+    return bool(final_text) and squash(answer).endswith(final_text)
 
 
 def settle(path, last_message, max_wait=None):
@@ -165,6 +171,7 @@ def settle(path, last_message, max_wait=None):
     """
     if max_wait is None:
         max_wait = SETTLE_MAX
+    last_message = (last_message or "").strip()
     deadline = time.monotonic() + max_wait
     answer = ""
     size = None
@@ -175,9 +182,17 @@ def settle(path, last_message, max_wait=None):
         except OSError:
             current = -1
         if current != size:
-            size = current
             quiet = 0
-            answer = extract_answer(iter_lines_reverse(path))
+            try:
+                candidate = extract_answer(iter_lines_reverse(path)) if current >= 0 else answer
+            except OSError:
+                # The file may disappear between stat and open. Retry even
+                # if it comes back with the same size, retaining any text
+                # already read so complete() can still add the final block.
+                size = None
+            else:
+                size = current
+                answer = candidate
             if caught_up(answer, last_message):
                 return answer
         else:
@@ -219,12 +234,19 @@ def log_error(exc):
 
 
 def write_answer(text, dest):
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    tmp = dest + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    # Atomic: a keypress landing mid-write must not read a half-written file.
-    os.replace(tmp, dest)
+    directory = os.path.dirname(dest)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    # Overlapping hooks need separate temporary files. mkstemp also keeps
+    # answers private (0600) regardless of the user's umask.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(dest) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        # A keypress landing mid-write must not read a half-written file.
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def prune(keep_days=KEEP_DAYS, now=None):
@@ -278,7 +300,7 @@ def main():
         transcript = payload.get("transcript_path")
         last_message = payload.get("last_assistant_message")
 
-    if not transcript or not os.path.exists(transcript):
+    if not transcript:
         # The payload still carries the final block; better than nothing.
         answer = complete("", last_message)
     else:

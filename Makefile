@@ -17,10 +17,10 @@ lint:
 		echo "lint: shellcheck not installed, skipping shell lint"; \
 	fi
 	@if python3 -m pyflakes --version >/dev/null 2>&1; then \
-		python3 -m pyflakes hooks/extract.py tests/test_extract.py; \
+		python3 -m pyflakes hooks/extract.py tests/*.py; \
 	else \
 		echo "lint: pyflakes not installed, falling back to py_compile"; \
-		python3 -m py_compile hooks/extract.py; \
+		python3 -m py_compile hooks/extract.py tests/*.py; \
 	fi
 
 check: lint test

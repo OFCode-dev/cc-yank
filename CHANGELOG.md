@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Restore Linux CI by explicitly quoting empty `CDPATH` assignments.
+- Preserve the order of multiple text blocks within an assistant message and
+  skip malformed message fields without losing the rest of the answer.
+- Retry missing or disappearing transcripts during settling, retaining text
+  already read and falling back to the Stop payload at the deadline.
+- Give overlapping hook writes separate atomic temporary files; store answers
+  with owner-only permissions.
+- Quote hook and tmux commands for repository paths containing shell syntax,
+  including when upgrading existing installations.
+- Keep repeated installs idempotent when `set-clipboard` is off; preserve
+  settings permissions and unrelated hooks on install and uninstall.
+- Remove tmux bindings even if tmux has been removed, avoid creating config
+  during uninstall, and replace the `kill-server` advice with `unbind-key y`.
+
+### Added
+- Regression tests for extraction races and installer behavior in disposable
+  homes, including a real tmux configuration/parser check on Linux CI.
+
 ## 0.2.0 — 2026-09-14
 
 ### Changed
