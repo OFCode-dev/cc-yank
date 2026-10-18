@@ -168,7 +168,10 @@ make lint     # shellcheck, when installed
 The tests build synthetic transcripts and drive the hook the way Claude Code
 does (payload on stdin, `TMUX_PANE` in the environment), including the case
 where the transcript is still behind when the hook fires. CI runs them on
-Linux and macOS. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+Linux and macOS. Installer tests use disposable homes and preserve the real
+user's configuration. When tmux is installed, they also verify the generated
+binding with an isolated tmux server; Linux CI includes this check.
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

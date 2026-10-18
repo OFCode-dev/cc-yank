@@ -8,8 +8,8 @@ set -eu
 # ------------------------------------------------------------------- locate
 # Resolve paths relative to this script, not the caller's cwd (install.sh
 # uses the same CDPATH= cd -- pattern for the same reason).
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ROOT=$(CDPATH= cd -- "$SELF_DIR/.." && pwd)
+SELF_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH='' cd -- "$SELF_DIR/.." && pwd)
 CLI="$ROOT/bin/cc-yank"
 
 TMP=$(mktemp -d)

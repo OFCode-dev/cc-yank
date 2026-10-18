@@ -67,8 +67,9 @@ One JSON object per line. Measured shape:
 
 Four things this dictates:
 
-1. **One content block per assistant line.** An answer is spread across many
-   lines, so all of them must be collected and re-joined in order.
+1. **One assistant message per line.** An answer can span many lines and a
+   message can hold several text blocks. Collect messages in chronological
+   order while preserving the order of the blocks within each message.
 2. **Tool results are `user` entries.** Naively stopping at the first `user`
    entry truncates every answer that used a tool. The boundary test is "a
    `user` entry containing at least one non-`tool_result` block".

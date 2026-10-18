@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
 import extract  # noqa: E402  (import after sys.path fixup, by design)
@@ -83,6 +84,23 @@ def write_jsonl(path, entries):
 # --------------------------------------------------------------- extract_answer
 
 class TestExtractAnswer(unittest.TestCase):
+    def test_multiple_text_blocks_keep_order_within_and_between_entries(self):
+        entries = [human_str("q")]
+        for texts in (("First", "Second"), ("Third", "Fourth")):
+            entries.append({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": text} for text in texts
+            ]}})
+        self.assertEqual(extract.extract_answer(reversed_lines(entries)),
+                         "First\n\nSecond\n\nThird\n\nFourth")
+
+    def test_malformed_message_and_text_fields_do_not_drop_valid_answer(self):
+        entries = [human_str("q"), assistant_text("Valid answer"),
+                   {"type": "assistant", "message": "invalid"},
+                   {"type": "assistant", "message": {"content": [
+                       {"type": "text", "text": 42}
+                   ]}}]
+        self.assertEqual(extract.extract_answer(reversed_lines(entries)), "Valid answer")
+
     def test_single_text_answer_drops_thinking_and_tool_use(self):
         entries = [
             human_str("question"),
@@ -208,6 +226,9 @@ class TestIterLinesReverse(unittest.TestCase):
 # --------------------------------------------------------------------- caught_up
 
 class TestCaughtUp(unittest.TestCase):
+    def test_whitespace_only_last_message_is_not_a_completion_signal(self):
+        self.assertFalse(extract.caught_up("Partial answer", " \n\t"))
+
     def test_whitespace_insensitive_suffix_match(self):
         answer = "line one\n\nline   two"
         self.assertTrue(extract.caught_up(answer, "line two"))
@@ -242,6 +263,31 @@ class TestSettle(unittest.TestCase):
         elapsed = time.monotonic() - start
         self.assertEqual(answer, last_message)
         self.assertLess(elapsed, 0.3)
+
+    def test_transcript_created_after_hook_starts_is_picked_up(self):
+        def create_transcript():
+            time.sleep(0.15)
+            write_jsonl(self.path, [human_str("q"), assistant_text("Final")])
+
+        writer = threading.Thread(target=create_transcript)
+        writer.start()
+        try:
+            self.assertEqual(extract.settle(self.path, "Final", max_wait=2), "Final")
+        finally:
+            writer.join()
+
+    def test_transcript_disappears_between_stat_and_read(self):
+        write_jsonl(self.path, [human_str("q"), assistant_text("Final")])
+        with mock.patch.object(extract, "iter_lines_reverse", side_effect=FileNotFoundError):
+            self.assertEqual(extract.settle(self.path, "Final", max_wait=0), "")
+
+    def test_disappearing_transcript_retains_text_already_read(self):
+        write_jsonl(self.path, [human_str("q"), assistant_text("Partial")])
+        stat = os.stat(self.path)
+        with mock.patch.object(extract.os, "stat", side_effect=[stat, FileNotFoundError]), \
+                mock.patch.object(extract.time, "monotonic", side_effect=[0, 0, 1]), \
+                mock.patch.object(extract.time, "sleep"):
+            self.assertEqual(extract.settle(self.path, "Final", max_wait=0.5), "Partial")
 
     def test_lagging_transcript_is_picked_up_once_it_arrives(self):
         last_message = "The final answer, delivered late."
@@ -335,6 +381,36 @@ class TestPrune(unittest.TestCase):
 # ---------------------------------------------------------------------- write_answer
 
 class TestWriteAnswer(unittest.TestCase):
+    def test_concurrent_writes_are_atomic_and_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "state", "pane-1.md")
+            barrier = threading.Barrier(2)
+            original_replace = os.replace
+            failures = []
+
+            def replace_together(src, dst):
+                barrier.wait(timeout=5)
+                original_replace(src, dst)
+
+            def write(text):
+                try:
+                    extract.write_answer(text, dest)
+                except Exception as exc:
+                    failures.append(exc)
+
+            with mock.patch.object(extract.os, "replace", side_effect=replace_together):
+                writers = [threading.Thread(target=write, args=(text,))
+                           for text in ("A" * 10000, "B" * 10000)]
+                for writer in writers:
+                    writer.start()
+                for writer in writers:
+                    writer.join()
+            self.assertEqual(failures, [])
+            with open(dest) as fh:
+                self.assertIn(fh.read(), ("A" * 10000, "B" * 10000))
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o600)
+            self.assertEqual(os.listdir(os.path.dirname(dest)), ["pane-1.md"])
+
     def test_atomic_no_tmp_left_behind(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = os.path.join(tmp, "sub", "pane-1.md")

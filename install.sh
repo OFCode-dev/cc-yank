@@ -8,7 +8,7 @@
 
 set -eu
 
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 SETTINGS="$HOME/.claude/settings.json"
 TMUX_CONF="$HOME/.tmux.conf"
 MARK_BEGIN="# >>> cc-yank >>>"
@@ -24,30 +24,37 @@ command -v python3 >/dev/null 2>&1 || {
     echo "cc-yank: python3 is required (stdlib only, no packages)." >&2
     exit 1
 }
-chmod +x "$REPO/hooks/extract.py" "$REPO/bin/cc-yank"
+if [ "$uninstall" -eq 0 ]; then
+    chmod +x "$REPO/hooks/extract.py" "$REPO/bin/cc-yank"
+fi
 
 # ---------------------------------------------------- ~/.claude/settings.json
 # Merged with python3 rather than sed: this file holds the user's whole
 # configuration and a botched edit costs them more than this tool is worth.
 echo "settings.json"
-if [ ! -f "$SETTINGS" ]; then
-    mkdir -p "$(dirname "$SETTINGS")"
-    printf '{}\n' > "$SETTINGS"
-    say "created $SETTINGS"
-fi
-
 python3 - "$SETTINGS" "$REPO/hooks/extract.py" "$uninstall" <<'PY'
-import json, os, shutil, sys, time
+import json, os, shlex, shutil, sys, time
 
 path, hook, uninstall = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-command = '"%s"' % hook
+command = shlex.quote(hook)
+# Recognize commands written by older installers as well.
+commands = {command, hook, '"%s"' % hook}
+
+if not os.path.isfile(path):
+    if uninstall:
+        print("  no cc-yank hook registered")
+        sys.exit(0)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("{}\n")
+    print("  created %s" % path)
 
 with open(path) as fh:
     settings = json.load(fh)
 
 stop = settings.setdefault("hooks", {}).setdefault("Stop", [])
 present = any(
-    h.get("command") in (command, hook)
+    h.get("command") in commands
     for entry in stop for h in entry.get("hooks", [])
 )
 
@@ -57,15 +64,23 @@ if uninstall:
         sys.exit(0)
     for entry in stop:
         entry["hooks"] = [
-            h for h in entry.get("hooks", []) if h.get("command") not in (command, hook)
+            h for h in entry.get("hooks", []) if h.get("command") not in commands
         ]
     settings["hooks"]["Stop"] = [e for e in stop if e.get("hooks")]
     if not settings["hooks"]["Stop"]:
         del settings["hooks"]["Stop"]
     action = "removed Stop hook"
 elif present:
-    print("  Stop hook already registered")
-    sys.exit(0)
+    changed = False
+    for entry in stop:
+        for h in entry.get("hooks", []):
+            if h.get("command") in commands and h["command"] != command:
+                h["command"] = command
+                changed = True
+    if not changed:
+        print("  Stop hook already registered")
+        sys.exit(0)
+    action = "updated Stop hook quoting"
 else:
     stop.append({"hooks": [{"type": "command", "command": command}]})
     action = "registered Stop hook"
@@ -82,16 +97,14 @@ tmp = path + ".tmp"
 with open(tmp, "w") as fh:
     json.dump(settings, fh, indent=2, ensure_ascii=False)
     fh.write("\n")
+shutil.copymode(path, tmp)
 os.replace(tmp, path)
 print("  %s (backup: %s)" % (action, os.path.basename(backup)))
 PY
 
 # ------------------------------------------------------------- ~/.tmux.conf
 echo "tmux"
-if ! command -v tmux >/dev/null 2>&1; then
-    say "tmux not installed — the keybinding is unavailable."
-    say "cc-yank still works as a CLI: $REPO/bin/cc-yank"
-elif [ "$uninstall" -eq 1 ]; then
+if [ "$uninstall" -eq 1 ]; then
     if [ -f "$TMUX_CONF" ] && grep -qF "$MARK_BEGIN" "$TMUX_CONF"; then
         tmp=$(mktemp)
         sed "/^$MARK_BEGIN\$/,/^$MARK_END\$/d" "$TMUX_CONF" > "$tmp"
@@ -100,17 +113,55 @@ elif [ "$uninstall" -eq 1 ]; then
     else
         say "no cc-yank binding found"
     fi
-elif [ -f "$TMUX_CONF" ] && grep -qF "$MARK_BEGIN" "$TMUX_CONF"; then
-    say "binding already present"
+elif ! command -v tmux >/dev/null 2>&1; then
+    say "tmux not installed — the keybinding is unavailable."
+    say "cc-yank still works as a CLI: $REPO/bin/cc-yank"
 else
-    cat >> "$TMUX_CONF" <<EOF
+    # Quote for two parsers: tmux reads a single command argument, then sh
+    # executes that command. A pair of double quotes around the path alone
+    # still expands dollar signs and breaks on embedded quotes.
+    binding=$(python3 - "$REPO/bin/cc-yank" <<'PY'
+import shlex, sys
+command = shlex.quote(sys.argv[1]).replace("#", "##") + " #{pane_id}"
+print("bind-key y run-shell -b " + shlex.quote(command))
+PY
+)
+    if [ -f "$TMUX_CONF" ] && grep -qF "$MARK_BEGIN" "$TMUX_CONF"; then
+        python3 - "$TMUX_CONF" "$binding" <<'PY'
+import os, shutil, sys
+path, binding = sys.argv[1:]
+with open(path) as fh:
+    original = fh.readlines()
+lines = []
+managed = False
+for line in original:
+    if line.rstrip("\n") == "# >>> cc-yank >>>":
+        managed = True
+    elif line.rstrip("\n") == "# <<< cc-yank <<<":
+        managed = False
+    if managed and line.startswith("bind-key y run-shell "):
+        line = binding + "\n"
+    lines.append(line)
+if lines != original:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.writelines(lines)
+    shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+    print("  updated binding quoting")
+else:
+    print("  binding already present")
+PY
+    else
+        cat >> "$TMUX_CONF" <<EOF
 $MARK_BEGIN
 # prefix + y copies Claude Code's last answer. Prefix-based on purpose: a raw
 # binding would swallow the key before Claude Code's TUI ever sees it.
-bind-key y run-shell -b '"$REPO/bin/cc-yank" #{pane_id}'
+$binding
 $MARK_END
 EOF
-    say "added prefix + y binding to $TMUX_CONF"
+        say "added prefix + y binding to $TMUX_CONF"
+    fi
 fi
 
 # set-clipboard drives OSC 52, the only thing that reaches a clipboard over
@@ -118,8 +169,11 @@ fi
 if command -v tmux >/dev/null 2>&1 && [ "$uninstall" -eq 0 ]; then
     clip=$(tmux show-options -gv set-clipboard 2>/dev/null || echo external)
     if [ "$clip" = "off" ]; then
-        printf '%s\nset -g set-clipboard external\n%s\n' "$MARK_BEGIN" "$MARK_END" >> "$TMUX_CONF"
-        say "set-clipboard was off — set to external (required for OSC 52)"
+        if ! sed -n "/^$MARK_BEGIN\$/,/^$MARK_END\$/p" "$TMUX_CONF" |
+            grep -qFx 'set -g set-clipboard external'; then
+            printf '%s\nset -g set-clipboard external\n%s\n' "$MARK_BEGIN" "$MARK_END" >> "$TMUX_CONF"
+        fi
+        say "set-clipboard is off — external is configured; reload tmux config to activate"
     else
         say "set-clipboard = $clip (ok)"
     fi
@@ -127,7 +181,7 @@ fi
 
 echo
 if [ "$uninstall" -eq 1 ]; then
-    echo "Uninstalled. Restart Claude Code, and run: tmux kill-server"
+    echo "Uninstalled. Restart Claude Code. In a running tmux, run: tmux unbind-key y"
 else
     cat <<EOF
 Installed. To activate:
